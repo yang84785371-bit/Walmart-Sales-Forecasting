@@ -1,0 +1,280 @@
+# scripts/train_transformer.py
+# -- Walmart sales forecast: Transformer encoder with X standardization + log1p target --
+# -- Train on seq_train.npz, validate on seq_valid.npz --
+# -- Outputs:
+# -- - output/transformer_metrics.json
+# -- - output/transformer_pred_valid.csv
+# -- - output/transformer_preprocess_stats.json
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+
+def evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    mae = float(np.mean(np.abs(y_true - y_pred)))
+    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    mape = float(np.mean(np.abs((y_true - y_pred) / np.clip(y_true, 1.0, None))))
+    wape = float(np.sum(np.abs(y_true - y_pred)) / np.clip(np.sum(np.abs(y_true)), 1.0, None))
+    return {"MAE": mae, "RMSE": rmse, "MAPE": mape, "WAPE": wape}
+
+
+def load_npz(path: Path) -> dict[str, np.ndarray]:
+    if not path.exists():
+        raise FileNotFoundError(f"npz not found: {path}")
+    obj = dict(np.load(path))
+    need = ["X", "y", "store", "dept", "date_ns"]
+    miss = [k for k in need if k not in obj]
+    if miss:
+        raise ValueError(f"npz missing keys: {miss}")
+    return obj
+
+
+def compute_standardizer(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    flat = X.reshape(-1, X.shape[-1]).astype(np.float32)
+    mean = flat.mean(axis=0)
+    std = flat.std(axis=0)
+    std = np.where(std < 1e-6, 1.0, std)
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
+def apply_standardizer(X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    return ((X - mean[None, None, :]) / std[None, None, :]).astype(np.float32)
+
+
+def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool) -> DataLoader:
+    X_t = torch.from_numpy(X).float()
+    y_t = torch.from_numpy(y).float()
+    ds = TensorDataset(X_t, y_t)
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
+
+
+@torch.no_grad()
+def predict(model: nn.Module, loader: DataLoader, device: torch.device) -> np.ndarray:
+    model.eval()
+    preds = []
+    for xb, _ in loader:
+        xb = xb.to(device)
+        yb = model(xb).detach().cpu().numpy()
+        preds.append(yb)
+    return np.concatenate(preds, axis=0)
+
+
+def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Optimizer, device: torch.device) -> float:
+    model.train()
+    total = 0.0
+    n = 0
+    loss_fn = nn.SmoothL1Loss(beta=0.2)
+    for xb, yb in loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+        optim.zero_grad(set_to_none=True)
+        pred = model(xb)
+        loss = loss_fn(pred, yb)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optim.step()
+        total += float(loss.item()) * xb.size(0)
+        n += xb.size(0)
+    return total / max(n, 1)
+
+
+@torch.no_grad()
+def valid_loss(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    total = 0.0
+    n = 0
+    loss_fn = nn.SmoothL1Loss(beta=0.2)
+    for xb, yb in loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+        pred = model(xb)
+        loss = loss_fn(pred, yb)
+        total += float(loss.item()) * xb.size(0)
+        n += xb.size(0)
+    return total / max(n, 1)
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 512) -> None:
+        super().__init__()
+        pe = torch.zeros(max_len, d_model, dtype=torch.float32)
+        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # -- x: (B, T, D)
+        T = x.size(1)
+        return x + self.pe[:, :T, :]
+
+
+class TransformerRegressor(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_ff: int,
+        dropout: float,
+        max_len: int,
+    ) -> None:
+        super().__init__()
+        self.proj = nn.Linear(input_dim, d_model)
+        self.pos = PositionalEncoding(d_model=d_model, max_len=max_len)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_ff,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # -- x: (B, T, F)
+        z = self.proj(x)
+        z = self.pos(z)
+        h = self.encoder(z)
+        last = h[:, -1, :]
+        y = self.head(last).squeeze(-1)
+        return y
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=str(Path.home() / "projects" / "walmart_sale_forecast" / "data"),
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=str(Path.home() / "projects" / "walmart_sale_forecast" / "output"),
+    )
+    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--batch_size", type=int, default=1024)
+    parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument("--d_model", type=int, default=128)
+    parser.add_argument("--nhead", type=int, default=8)
+    parser.add_argument("--num_layers", type=int, default=3)
+    parser.add_argument("--dim_ff", type=int, default=256)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--patience", type=int, default=3)
+    args = parser.parse_args(argv)
+
+    data_dir = Path(args.data_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    train_npz = load_npz(data_dir / "seq_train.npz")
+    valid_npz = load_npz(data_dir / "seq_valid.npz")
+
+    X_train_raw = train_npz["X"].astype(np.float32)
+    y_train_raw = train_npz["y"].astype(np.float32)
+    X_valid_raw = valid_npz["X"].astype(np.float32)
+    y_valid_raw = valid_npz["y"].astype(np.float32)
+
+    # -- Standardize X using train statistics only
+    mean, std = compute_standardizer(X_train_raw)
+    X_train = apply_standardizer(X_train_raw, mean, std)
+    X_valid = apply_standardizer(X_valid_raw, mean, std)
+
+    # -- log1p target
+    y_train = np.log1p(y_train_raw).astype(np.float32)
+    y_valid = np.log1p(y_valid_raw).astype(np.float32)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    train_loader = make_loader(X_train, y_train, batch_size=args.batch_size, shuffle=True)
+    valid_loader = make_loader(X_valid, y_valid, batch_size=args.batch_size, shuffle=False)
+
+    model = TransformerRegressor(
+        input_dim=X_train.shape[-1],
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_layers=args.num_layers,
+        dim_ff=args.dim_ff,
+        dropout=args.dropout,
+        max_len=X_train.shape[1],
+    ).to(device)
+
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    best_v = float("inf")
+    bad = 0
+    best_state = None
+
+    for ep in range(1, args.epochs + 1):
+        tr = train_one_epoch(model, train_loader, optim, device)
+        va = valid_loss(model, valid_loader, device)
+        print(f"[EPOCH] {ep:03d} train_loss={tr:.6f} valid_loss={va:.6f}")
+
+        if va < best_v - 1e-6:
+            best_v = va
+            bad = 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= args.patience:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    y_pred_log = predict(model, valid_loader, device=device)
+    y_pred = np.expm1(y_pred_log).astype(np.float32)
+
+    metrics = evaluate(y_valid_raw, y_pred)
+
+    with open(output_dir / "transformer_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+    out_df = pd.DataFrame(
+        {
+            "Store": valid_npz["store"].astype(int),
+            "Dept": valid_npz["dept"].astype(int),
+            "Date": pd.to_datetime(valid_npz["date_ns"].astype(np.int64)),
+            "y_true": y_valid_raw.astype(float),
+            "y_pred": y_pred.astype(float),
+        }
+    )
+    out_df.to_csv(output_dir / "transformer_pred_valid.csv", index=False)
+
+    stats = {
+        "x_mean": mean.tolist(),
+        "x_std": std.tolist(),
+        "y_transform": "log1p",
+    }
+    with open(output_dir / "transformer_preprocess_stats.json", "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
+
+    print("[OK] Transformer training finished")
+    for k, v in metrics.items():
+        print(f"[METRIC] {k} = {v:.4f}")
+
+
+if __name__ == "__main__":
+    main()
